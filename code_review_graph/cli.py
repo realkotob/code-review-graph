@@ -84,6 +84,7 @@ def _print_banner() -> None:
     {g}register{r}    Register a repository in the multi-repo registry
     {g}unregister{r}  Remove a repository from the registry
     {g}repos{r}       List registered repositories
+    {g}eval{r}        Run evaluation benchmarks
     {g}serve{r}       Start MCP server
 
   {d}Run{r} {b}code-review-graph <command> --help{r} {d}for details{r}
@@ -242,6 +243,10 @@ def main() -> None:
     # visualize
     vis_cmd = sub.add_parser("visualize", help="Generate interactive HTML graph visualization")
     vis_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    vis_cmd.add_argument(
+        "--serve", action="store_true",
+        help="Start a local HTTP server to view the visualization (localhost:8765)",
+    )
 
     # wiki
     wiki_cmd = sub.add_parser("wiki", help="Generate markdown wiki from community structure")
@@ -267,6 +272,14 @@ def main() -> None:
     # repos
     sub.add_parser("repos", help="List registered repositories")
 
+    # eval
+    eval_cmd = sub.add_parser("eval", help="Run evaluation benchmarks")
+    eval_cmd.add_argument(
+        "--benchmark", default="token_efficiency",
+        help="Benchmark to run (token_efficiency, mrr, precision_recall)",
+    )
+    eval_cmd.add_argument("--repo", default=None, help="Target repository for benchmarking")
+
     # serve
     serve_cmd = sub.add_parser("serve", help="Start MCP server (stdio transport)")
     serve_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
@@ -284,6 +297,14 @@ def main() -> None:
     if args.command == "serve":
         from .main import main as serve_main
         serve_main(repo_root=args.repo)
+        return
+
+    if args.command == "eval":
+        print(f"Benchmark runner for '{args.benchmark}' is not yet implemented.")
+        print("The scorer and reporter modules are available for programmatic use:")
+        print("  from code_review_graph.eval import (")
+        print("      compute_token_efficiency, compute_mrr,")
+        print("      compute_precision_recall, generate_markdown_report)")
         return
 
     if args.command in ("init", "install"):
@@ -379,7 +400,25 @@ def main() -> None:
             html_path = repo_root / ".code-review-graph" / "graph.html"
             generate_html(store, html_path)
             print(f"Visualization: {html_path}")
-            print("Open in browser to explore your codebase graph.")
+            if getattr(args, "serve", False):
+                import functools
+                import http.server
+
+                serve_dir = html_path.parent
+                port = 8765
+                handler = functools.partial(
+                    http.server.SimpleHTTPRequestHandler,
+                    directory=str(serve_dir),
+                )
+                print(f"Serving at http://localhost:{port}/graph.html")
+                print("Press Ctrl+C to stop.")
+                with http.server.HTTPServer(("localhost", port), handler) as httpd:
+                    try:
+                        httpd.serve_forever()
+                    except KeyboardInterrupt:
+                        print("\nServer stopped.")
+            else:
+                print("Open in browser to explore your codebase graph.")
 
         elif args.command == "wiki":
             from .wiki import generate_wiki
