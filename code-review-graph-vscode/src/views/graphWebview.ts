@@ -534,6 +534,9 @@ export class GraphWebviewPanel {
     .pulse-ring {
       animation: pulse 0.6s ease-out;
     }
+
+    path.node-shape:focus { outline: none; }
+    path.node-shape:focus-visible { stroke: var(--btn-bg, #89b4fa) !important; stroke-width: 3 !important; }
   </style>
 </head>
 <body>

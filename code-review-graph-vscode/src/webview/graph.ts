@@ -448,7 +448,61 @@ function buildGraph(): void {
           d.fx = null;
           d.fy = null;
         })
-    );
+    )
+    .attr("tabindex", 0)
+    .attr("role", "button")
+    .attr("aria-label", (d) => `${d.kind}: ${d.name}`)
+    .on("keydown", (event: KeyboardEvent, d: SimNode) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectNode(d);
+        vscodeApi.postMessage({
+          command: "nodeClicked",
+          qualifiedName: d.qualifiedName,
+          filePath: d.filePath,
+          lineStart: d.lineStart ?? 1,
+        });
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        selectedNode = null;
+        unhighlightAll();
+        nodeSelection.attr("stroke", "none");
+      } else if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) {
+        event.preventDefault();
+        const visibleNodes = nodeSelection.data();
+        let best: SimNode | null = null;
+        let bestDist = Infinity;
+        for (const n of visibleNodes) {
+          if (n.qualifiedName === d.qualifiedName || n.x == null || n.y == null || d.x == null || d.y == null) continue;
+          const dx = n.x - d.x;
+          const dy = n.y - d.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          let ok = false;
+          if (event.key === "ArrowRight" && dx > 0 && Math.abs(dy) < Math.abs(dx)) ok = true;
+          if (event.key === "ArrowLeft" && dx < 0 && Math.abs(dy) < Math.abs(dx)) ok = true;
+          if (event.key === "ArrowDown" && dy > 0 && Math.abs(dx) < Math.abs(dy)) ok = true;
+          if (event.key === "ArrowUp" && dy < 0 && Math.abs(dx) < Math.abs(dy)) ok = true;
+          if (ok && dist < bestDist) {
+            best = n;
+            bestDist = dist;
+          }
+        }
+        if (best) {
+          const target = nodeGroup.selectAll<SVGPathElement, SimNode>("path.node-shape")
+            .filter((n) => n.qualifiedName === best!.qualifiedName)
+            .node();
+          if (target) (target as HTMLElement).focus();
+        }
+      }
+    })
+    .on("focus", (_event: FocusEvent, d: SimNode) => {
+      showTooltip(d);
+      highlightConnected(d);
+    })
+    .on("blur", () => {
+      hideTooltip();
+      unhighlightAll();
+    });
 
   // Highlight search matches
   const searchInput = document.getElementById("search-input") as HTMLInputElement | null;
