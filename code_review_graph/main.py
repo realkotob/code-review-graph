@@ -21,6 +21,7 @@ from .tools import (
     apply_refactor_func,
     build_or_update_graph,
     cross_repo_search_func,
+    run_postprocess,
     detect_changes_func,
     embed_graph,
     find_large_functions,
@@ -61,6 +62,7 @@ def build_or_update_graph_tool(
     full_rebuild: bool = False,
     repo_root: Optional[str] = None,
     base: str = "HEAD~1",
+    postprocess: str = "full",
 ) -> dict:
     """Build or incrementally update the code knowledge graph.
 
@@ -72,9 +74,35 @@ def build_or_update_graph_tool(
         full_rebuild: If True, re-parse all files. Default: False (incremental).
         repo_root: Repository root path. Auto-detected from current directory if omitted.
         base: Git ref to diff against for incremental updates. Default: HEAD~1.
+        postprocess: Post-processing level: "full" (default), "minimal" (signatures+FTS only),
+                     or "none" (skip all post-processing). Use "minimal" for faster builds.
     """
     return build_or_update_graph(
-        full_rebuild=full_rebuild, repo_root=repo_root, base=base
+        full_rebuild=full_rebuild, repo_root=repo_root, base=base,
+        postprocess=postprocess,
+    )
+
+
+@mcp.tool()
+def run_postprocess_tool(
+    flows: bool = True,
+    communities: bool = True,
+    fts: bool = True,
+    repo_root: Optional[str] = None,
+) -> dict:
+    """Run post-processing on existing graph (flows, communities, FTS index).
+
+    Use after building with postprocess="none" or "minimal", or to re-run
+    expensive steps independently. Signatures are always computed.
+
+    Args:
+        flows: Run flow detection. Default: True.
+        communities: Run community detection. Default: True.
+        fts: Rebuild FTS index. Default: True.
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    return run_postprocess(
+        flows=flows, communities=communities, fts=fts, repo_root=repo_root,
     )
 
 

@@ -86,6 +86,7 @@ def _print_banner() -> None:
     {g}register{r}    Register a repository in the multi-repo registry
     {g}unregister{r}  Remove a repository from the registry
     {g}repos{r}       List registered repositories
+    {g}postprocess{r} Run post-processing {d}(flows, communities, FTS){r}
     {g}eval{r}        Run evaluation benchmarks
     {g}serve{r}       Start MCP server
 
@@ -226,11 +227,37 @@ def main() -> None:
     # build
     build_cmd = sub.add_parser("build", help="Full graph build (re-parse all files)")
     build_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    build_cmd.add_argument(
+        "--skip-flows", action="store_true",
+        help="Skip flow/community detection (signatures + FTS only)",
+    )
+    build_cmd.add_argument(
+        "--skip-postprocess", action="store_true",
+        help="Skip all post-processing (raw parse only)",
+    )
 
     # update
     update_cmd = sub.add_parser("update", help="Incremental update (only changed files)")
     update_cmd.add_argument("--base", default="HEAD~1", help="Git diff base (default: HEAD~1)")
     update_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    update_cmd.add_argument(
+        "--skip-flows", action="store_true",
+        help="Skip flow/community detection (signatures + FTS only)",
+    )
+    update_cmd.add_argument(
+        "--skip-postprocess", action="store_true",
+        help="Skip all post-processing (raw parse only)",
+    )
+
+    # postprocess
+    pp_cmd = sub.add_parser(
+        "postprocess",
+        help="Run post-processing on existing graph (flows, communities, FTS)",
+    )
+    pp_cmd.add_argument("--repo", default=None, help="Repository root (auto-detected)")
+    pp_cmd.add_argument("--no-flows", action="store_true", help="Skip flow detection")
+    pp_cmd.add_argument("--no-communities", action="store_true", help="Skip community detection")
+    pp_cmd.add_argument("--no-fts", action="store_true", help="Skip FTS rebuild")
 
     # watch
     watch_cmd = sub.add_parser("watch", help="Watch for changes and auto-update")
@@ -402,6 +429,30 @@ def main() -> None:
         watch,
     )
 
+    if args.command == "postprocess":
+        repo_root = Path(args.repo) if args.repo else find_project_root()
+        db_path = get_db_path(repo_root)
+        store = GraphStore(db_path)
+        try:
+            from .tools.build import run_postprocess
+            result = run_postprocess(
+                flows=not getattr(args, "no_flows", False),
+                communities=not getattr(args, "no_communities", False),
+                fts=not getattr(args, "no_fts", False),
+                repo_root=str(repo_root),
+            )
+            parts = []
+            if result.get("flows_detected"):
+                parts.append(f"{result['flows_detected']} flows")
+            if result.get("communities_detected"):
+                parts.append(f"{result['communities_detected']} communities")
+            if result.get("fts_indexed"):
+                parts.append(f"{result['fts_indexed']} FTS entries")
+            print(f"Post-processing: {', '.join(parts) or 'done'}")
+        finally:
+            store.close()
+        return
+
     if args.command in ("update", "detect-changes"):
         # update and detect-changes require git for diffing
         repo_root = Path(args.repo) if args.repo else find_repo_root()
@@ -420,19 +471,40 @@ def main() -> None:
 
     try:
         if args.command == "build":
-            result = full_build(repo_root, store)
-            print(
-                f"Full build: {result['files_parsed']} files, "
-                f"{result['total_nodes']} nodes, {result['total_edges']} edges"
+            pp = "none" if getattr(args, "skip_postprocess", False) else (
+                "minimal" if getattr(args, "skip_flows", False) else "full"
             )
-            if result["errors"]:
+            from .tools.build import build_or_update_graph
+            result = build_or_update_graph(
+                full_rebuild=True, repo_root=str(repo_root), postprocess=pp,
+            )
+            parsed = result.get("files_parsed", 0)
+            nodes = result.get("total_nodes", 0)
+            edges = result.get("total_edges", 0)
+            print(
+                f"Full build: {parsed} files, "
+                f"{nodes} nodes, {edges} edges"
+                f" (postprocess={pp})"
+            )
+            if result.get("errors"):
                 print(f"Errors: {len(result['errors'])}")
 
         elif args.command == "update":
-            result = incremental_update(repo_root, store, base=args.base)
+            pp = "none" if getattr(args, "skip_postprocess", False) else (
+                "minimal" if getattr(args, "skip_flows", False) else "full"
+            )
+            from .tools.build import build_or_update_graph
+            result = build_or_update_graph(
+                full_rebuild=False, repo_root=str(repo_root),
+                base=args.base, postprocess=pp,
+            )
+            updated = result.get("files_updated", 0)
+            nodes = result.get("total_nodes", 0)
+            edges = result.get("total_edges", 0)
             print(
-                f"Incremental: {result['files_updated']} files updated, "
-                f"{result['total_nodes']} nodes, {result['total_edges']} edges"
+                f"Incremental: {updated} files updated, "
+                f"{nodes} nodes, {edges} edges"
+                f" (postprocess={pp})"
             )
 
         elif args.command == "status":

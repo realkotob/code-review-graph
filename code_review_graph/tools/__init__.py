@@ -44,7 +44,7 @@ from ._common import (
 )
 
 # -- build ------------------------------------------------------------------
-from .build import build_or_update_graph
+from .build import build_or_update_graph, run_postprocess
 
 # -- community_tools --------------------------------------------------------
 from .community_tools import (
@@ -88,6 +88,7 @@ __all__ = [
     "_validate_repo_root",
     # build
     "build_or_update_graph",
+    "run_postprocess",
     # community_tools
     "get_architecture_overview_func",
     "get_community_func",

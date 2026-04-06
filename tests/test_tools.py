@@ -686,3 +686,74 @@ class TestCommunityTools:
         assert "Architecture:" in result["summary"]
         assert "communities" in result["summary"]
         assert "cross-community edges" in result["summary"]
+
+
+class TestBuildPostprocess:
+    """Tests for postprocess parameter in build_or_update_graph."""
+
+    def setup_method(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = Path(self.tmp)
+        (self.root / ".git").mkdir()
+        (self.root / "sample.py").write_text(
+            "def hello():\n    pass\n\nclass Foo:\n    pass\n"
+        )
+
+    def teardown_method(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_postprocess_none_produces_nodes_no_flows(self):
+        from unittest.mock import patch
+        from code_review_graph.tools.build import build_or_update_graph
+
+        with patch(
+            "code_review_graph.incremental.get_all_tracked_files",
+            return_value=["sample.py"],
+        ):
+            result = build_or_update_graph(
+                full_rebuild=True, repo_root=str(self.root),
+                postprocess="none",
+            )
+        assert result["status"] == "ok"
+        assert result["total_nodes"] > 0
+        assert result.get("postprocess_level") == "none"
+        assert "flows_detected" not in result
+        assert "communities_detected" not in result
+        assert "fts_indexed" not in result
+
+    def test_postprocess_minimal_has_fts_no_flows(self):
+        from unittest.mock import patch
+        from code_review_graph.tools.build import build_or_update_graph
+
+        with patch(
+            "code_review_graph.incremental.get_all_tracked_files",
+            return_value=["sample.py"],
+        ):
+            result = build_or_update_graph(
+                full_rebuild=True, repo_root=str(self.root),
+                postprocess="minimal",
+            )
+        assert result["status"] == "ok"
+        assert result.get("postprocess_level") == "minimal"
+        assert result.get("signatures_updated") is True
+        assert "flows_detected" not in result
+        assert "communities_detected" not in result
+
+    def test_postprocess_full_matches_default(self):
+        from unittest.mock import patch
+        from code_review_graph.tools.build import build_or_update_graph
+
+        with patch(
+            "code_review_graph.incremental.get_all_tracked_files",
+            return_value=["sample.py"],
+        ):
+            result = build_or_update_graph(
+                full_rebuild=True, repo_root=str(self.root),
+                postprocess="full",
+            )
+        assert result["status"] == "ok"
+        assert result.get("postprocess_level") == "full"
+        # Full postprocess should have flows and communities
+        assert "flows_detected" in result
+        assert "communities_detected" in result
