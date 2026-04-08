@@ -892,3 +892,263 @@ class TestGDScriptParsing:
     def test_nodes_have_gdscript_language(self):
         for node in self.nodes:
             assert node.language == "gdscript"
+
+    # ------------------------------------------------------------------
+    # Phase A1 — signals
+    # ------------------------------------------------------------------
+    def test_signals_emitted_as_function_nodes(self):
+        signals = [
+            n for n in self.nodes
+            if n.extra.get("gdscript_kind") == "signal"
+        ]
+        names = {s.name for s in signals}
+        assert "hit" in names
+        assert "died" in names
+        hit = next(s for s in signals if s.name == "hit")
+        assert hit.parent_name == "MyClass"
+        assert hit.kind == "Function"
+        assert hit.params is not None
+        assert "damage" in hit.params
+
+    def test_signals_have_contains_edges(self):
+        contains = [e for e in self.edges if e.kind == "CONTAINS"]
+        targets = {e.target for e in contains}
+        assert any(t.endswith("MyClass.hit") for t in targets)
+        assert any(t.endswith("MyClass.died") for t in targets)
+
+    def test_emit_signal_string_resolves_to_signal(self):
+        # emit_signal("hit", 3) should produce a CALLS edge whose
+        # target resolves to the signal `hit` (in addition to the
+        # regular CALLS edge to "emit_signal" itself).
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        ready_calls = [
+            e for e in calls
+            if e.source.split("::")[-1].endswith("_ready")
+        ]
+        targets = {e.target for e in ready_calls}
+        # Either resolved to the qualified signal name or the bare "hit".
+        assert any(
+            t == "hit" or t.endswith("MyClass.hit") or t.endswith(".hit")
+            for t in targets
+        )
+
+    def test_dot_emit_resolves_to_signal_receiver(self):
+        # hit.emit(5) and died.emit() should add CALLS edges to the
+        # signal receiver identifiers.
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        ready_calls = [
+            e for e in calls
+            if e.source.split("::")[-1].endswith("_ready")
+        ]
+        targets = {e.target for e in ready_calls}
+        assert any(
+            t == "died" or t.endswith(".died") for t in targets
+        )
+
+    # ------------------------------------------------------------------
+    # Phase A2 — enums
+    # ------------------------------------------------------------------
+    def test_named_enum_emitted(self):
+        enums = [
+            n for n in self.nodes
+            if n.extra.get("gdscript_kind") == "enum"
+        ]
+        names = {e.name for e in enums}
+        assert "State" in names
+        state = next(e for e in enums if e.name == "State")
+        assert state.parent_name == "MyClass"
+        assert state.kind == "Function"
+
+    def test_enum_members_have_parent_and_values(self):
+        members = [
+            n for n in self.nodes
+            if n.extra.get("gdscript_kind") == "enum_member"
+        ]
+        by_name = {m.name: m for m in members}
+        assert set(["IDLE", "RUN", "JUMP"]).issubset(by_name.keys())
+        assert by_name["IDLE"].parent_name == "State"
+        assert by_name["RUN"].parent_name == "State"
+        assert by_name["RUN"].extra.get("value") == "2"
+        assert by_name["JUMP"].extra.get("value") is None
+
+    def test_anonymous_enum_members_attach_to_enclosing_class(self):
+        members = [
+            n for n in self.nodes
+            if n.extra.get("gdscript_kind") == "enum_member"
+            and n.name in ("ANON_A", "ANON_B")
+        ]
+        assert len(members) == 2
+        for m in members:
+            assert m.parent_name == "MyClass"
+
+    # ------------------------------------------------------------------
+    # Phase A3 — annotations
+    # ------------------------------------------------------------------
+    def test_tool_annotation_attaches_to_public_class(self):
+        my_class = next(
+            n for n in self.nodes
+            if n.kind == "Class" and n.name == "MyClass"
+        )
+        names = [a["name"] for a in my_class.extra.get("annotations", [])]
+        assert "tool" in names
+
+    def test_export_annotation_on_variable(self):
+        health = next(
+            n for n in self.nodes
+            if n.name == "health"
+            and n.extra.get("gdscript_kind") == "property"
+        )
+        names = [a["name"] for a in health.extra.get("annotations", [])]
+        assert "export" in names
+
+    def test_export_range_annotation_captures_args(self):
+        speed = next(
+            n for n in self.nodes
+            if n.name == "speed"
+            and n.extra.get("gdscript_kind") == "property"
+        )
+        anns = speed.extra.get("annotations", [])
+        export_range = next(
+            (a for a in anns if a["name"] == "export_range"), None,
+        )
+        assert export_range is not None
+        assert export_range["args"] is not None
+        assert "0" in export_range["args"]
+        assert "200" in export_range["args"]
+
+    def test_onready_annotation_on_variable(self):
+        sprite = next(
+            n for n in self.nodes
+            if n.name == "sprite"
+            and n.extra.get("gdscript_kind") == "property"
+        )
+        names = [a["name"] for a in sprite.extra.get("annotations", [])]
+        assert "onready" in names
+
+    # ------------------------------------------------------------------
+    # Phase A4 — property accessors
+    # ------------------------------------------------------------------
+    def test_property_emits_get_set_accessors(self):
+        accessors = [
+            n for n in self.nodes
+            if n.extra.get("gdscript_kind") == "accessor"
+            and n.parent_name == "score"
+        ]
+        names = {a.name for a in accessors}
+        assert "get" in names
+        assert "set" in names
+
+    def test_property_accessor_contains_edges(self):
+        contains = [e for e in self.edges if e.kind == "CONTAINS"]
+        sources_targets = {(e.source, e.target) for e in contains}
+        assert any(
+            s.endswith("::score") and t.endswith("score.get")
+            for s, t in sources_targets
+        )
+        assert any(
+            s.endswith("::score") and t.endswith("score.set")
+            for s, t in sources_targets
+        )
+
+    def test_legacy_setget_records_identifiers(self):
+        legacy = next(
+            n for n in self.nodes
+            if n.name == "legacy"
+            and n.extra.get("gdscript_kind") == "property"
+        )
+        assert legacy.extra.get("legacy_setter") == "set_legacy"
+        assert legacy.extra.get("legacy_getter") == "get_legacy"
+
+    # ------------------------------------------------------------------
+    # Phase A5 — lambdas
+    # ------------------------------------------------------------------
+    def test_lambda_extracted_as_named_function(self):
+        lambdas = [
+            n for n in self.nodes
+            if n.extra.get("gdscript_kind") == "lambda"
+        ]
+        names = {lmb.name for lmb in lambdas}
+        assert "add_fn" in names
+        assert "shout" in names
+
+    def test_lambda_body_calls_extracted(self):
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        shout_calls = {
+            e.target for e in calls
+            if e.source.split("::")[-1].endswith("shout")
+        }
+        assert any(t == "print" or t.endswith("print") for t in shout_calls)
+
+
+class TestGDScript3xParsing:
+    """Phase D — GDScript 3.x dialect coverage.
+
+    The tree-sitter grammar is unified for 3.x/4.x, but several 3.x-only
+    constructs parse as their own node types (``onready_variable_statement``,
+    ``remote_keyword``) that the 4.x-focused extractor would otherwise
+    drop. These tests pin the 3.x behavior.
+    """
+
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(
+            FIXTURES / "sample_gd3.gd",
+        )
+
+    def test_onready_var_emitted_with_onready_annotation(self):
+        sprite = next(
+            (
+                n for n in self.nodes
+                if n.name == "sprite"
+                and n.extra.get("gdscript_kind") == "property"
+            ),
+            None,
+        )
+        assert sprite is not None
+        names = [a["name"] for a in sprite.extra.get("annotations", [])]
+        assert "onready" in names
+
+    def test_legacy_setget_still_records_identifiers(self):
+        score = next(
+            (
+                n for n in self.nodes
+                if n.name == "score"
+                and n.extra.get("gdscript_kind") == "property"
+            ),
+            None,
+        )
+        assert score is not None
+        assert score.extra.get("legacy_setter") == "set_score"
+        assert score.extra.get("legacy_getter") == "get_score"
+
+    def test_remote_keyword_becomes_annotation(self):
+        fn = next(
+            n for n in self.nodes
+            if n.kind == "Function" and n.name == "networked_action"
+        )
+        names = [a["name"] for a in fn.extra.get("annotations", [])]
+        assert "remote" in names
+
+    def test_master_keyword_becomes_annotation(self):
+        fn = next(
+            n for n in self.nodes
+            if n.kind == "Function" and n.name == "master_only"
+        )
+        names = [a["name"] for a in fn.extra.get("annotations", [])]
+        assert "master" in names
+
+    def test_puppet_keyword_becomes_annotation(self):
+        fn = next(
+            n for n in self.nodes
+            if n.kind == "Function" and n.name == "puppet_only"
+        )
+        names = [a["name"] for a in fn.extra.get("annotations", [])]
+        assert "puppet" in names
+
+    def test_remotesync_keyword_becomes_annotation(self):
+        fn = next(
+            n for n in self.nodes
+            if n.kind == "Function" and n.name == "everyone"
+        )
+        names = [a["name"] for a in fn.extra.get("annotations", [])]
+        assert "remotesync" in names

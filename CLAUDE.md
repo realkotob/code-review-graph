@@ -15,7 +15,9 @@ When using code-review-graph MCP tools, follow these rules:
 ## Architecture
 
 - **Core Package**: `code_review_graph/` (Python 3.10+)
-  - `parser.py` — Tree-sitter multi-language AST parser (19 languages including Vue SFC, Solidity, Dart, R, Perl, Lua + Jupyter/Databricks notebooks)
+  - `parser.py` — Tree-sitter multi-language AST parser (20 languages including Vue SFC, Solidity, Dart, R, Perl, Lua, GDScript 3.x/4.x + Jupyter/Databricks notebooks + Godot .tscn/.tres scene files)
+  - `godot_project_resolver.py` — Resolves `res://` paths and autoloads by walking up to `project.godot`
+  - `godot_scene_parser.py` — Hand-rolled regex parser for `.tscn` / `.tres` `ext_resource` references
   - `graph.py` — SQLite-backed graph store (nodes, edges, BFS impact analysis)
   - `tools.py` — 22 MCP tool implementations
   - `main.py` — FastMCP server entry point (stdio transport), registers 22 tools + 5 prompts

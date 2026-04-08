@@ -16,6 +16,8 @@ from typing import NamedTuple, Optional
 
 import tree_sitter_language_pack as tslp
 
+from .godot_project_resolver import GodotProjectResolver
+from .godot_scene_parser import extract_scene_references
 from .tsconfig_resolver import TsconfigResolver
 
 
@@ -102,6 +104,8 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".xs": "c",  # Perl XS: parsed as C to capture functions/structs/includes
     ".lua": "lua",
     ".gd": "gdscript",
+    ".tscn": "godot_scene",
+    ".tres": "godot_scene",
     ".ipynb": "notebook",
 }
 
@@ -298,6 +302,7 @@ class CodeParser:
         self._parsers: dict[str, object] = {}
         self._module_file_cache: dict[str, Optional[str]] = {}
         self._tsconfig_resolver = TsconfigResolver()
+        self._godot_project_resolver = GodotProjectResolver()
 
     def _get_parser(self, language: str):  # type: ignore[arg-type]
         if language not in self._parsers:
@@ -342,6 +347,11 @@ class CodeParser:
         ):
             return self._parse_databricks_py_notebook(path, source)
 
+        # Godot scene/resource files: no tree-sitter grammar bundled;
+        # run the hand-rolled regex extractor instead.
+        if language == "godot_scene":
+            return self._parse_godot_scene(path, source)
+
         parser = self._get_parser(language)
         if not parser:
             return [], []
@@ -368,11 +378,71 @@ class CodeParser:
             tree.root_node, language, source,
         )
 
+        # GDScript: pre-compute the line -> annotations map so that
+        # function/class annotations (which parse as preceding siblings
+        # rather than wrapped children) can be attached post-walk.
+        gdscript_annotation_map: Optional[dict[int, list[dict]]] = None
+        if language == "gdscript":
+            gdscript_annotation_map = (
+                self._gdscript_build_annotation_line_map(tree.root_node)
+            )
+
         # Walk the tree
         self._extract_from_tree(
             tree.root_node, source, language, file_path_str, nodes, edges,
             import_map=import_map, defined_names=defined_names,
         )
+
+        # GDScript: attach collected annotations to their Class / Function
+        # / Test nodes. The pre-pass captures both preceding-sibling
+        # annotations (top-level layout) and inner ``annotations`` wrapper
+        # children (class-body layout). Skip any node that already carries
+        # a gdscript_kind — variables, signals, enums, accessors, enum
+        # members, and lambdas handle their own annotations inline.
+        if gdscript_annotation_map:
+            for n in nodes:
+                if n.language != "gdscript":
+                    continue
+                if n.kind not in ("Class", "Function", "Test"):
+                    continue
+                if n.extra.get("gdscript_kind") is not None:
+                    continue
+                line_key = n.line_start - 1
+                ann = gdscript_annotation_map.get(line_key)
+                if ann:
+                    existing = n.extra.get("annotations") or []
+                    n.extra["annotations"] = list(existing) + ann
+
+        # GDScript: emit IMPORTS_FROM edges for each autoload the file
+        # actually references by name. Autoloads are globally visible in
+        # Godot, but we avoid an edge explosion by only linking to those
+        # whose identifier appears in the source text.
+        if language == "gdscript":
+            autoloads = self._godot_project_resolver.get_autoloads(
+                file_path_str,
+            )
+            if autoloads:
+                text = source.decode("utf-8", errors="replace")
+                for name, rel_path in autoloads.items():
+                    pattern = re.compile(
+                        rf"\b{re.escape(name)}\b",
+                    )
+                    if not pattern.search(text):
+                        continue
+                    resolved = (
+                        self._godot_project_resolver.resolve_res_path(
+                            rel_path, file_path_str,
+                        )
+                    )
+                    target = resolved if resolved else rel_path
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=file_path_str,
+                        target=target,
+                        file_path=file_path_str,
+                        line=1,
+                        extra={"gdscript_autoload": name},
+                    ))
 
         # Resolve bare call targets to qualified names using same-file definitions
         edges = self._resolve_call_targets(nodes, edges, file_path_str)
@@ -394,6 +464,47 @@ class CodeParser:
                         file_path=edge.file_path,
                         line=edge.line,
                     ))
+
+        return nodes, edges
+
+    def _parse_godot_scene(
+        self, path: Path, source: bytes,
+    ) -> tuple[list[NodeInfo], list[EdgeInfo]]:
+        """Parse a Godot ``.tscn`` / ``.tres`` file for ext_resource refs.
+
+        Emits one ``File`` node plus an ``IMPORTS_FROM`` edge per
+        ``ext_resource`` header. Script references target the .gd file
+        resolved via ``GodotProjectResolver``; packed-scene / texture
+        references target their resolved paths too so the graph can
+        follow scene-to-scene dependencies.
+        """
+        file_path_str = str(path)
+        nodes: list[NodeInfo] = [
+            NodeInfo(
+                kind="File",
+                name=file_path_str,
+                file_path=file_path_str,
+                line_start=1,
+                line_end=source.count(b"\n") + 1,
+                language="godot_scene",
+                is_test=False,
+            ),
+        ]
+        edges: list[EdgeInfo] = []
+
+        for ref in extract_scene_references(source, file_path_str):
+            resolved = self._godot_project_resolver.resolve_res_path(
+                ref.path, file_path_str,
+            )
+            target = resolved if resolved else ref.path
+            edges.append(EdgeInfo(
+                kind="IMPORTS_FROM",
+                source=file_path_str,
+                target=target,
+                file_path=file_path_str,
+                line=ref.line,
+                extra={"godot_resource_type": ref.resource_type},
+            ))
 
         return nodes, edges
 
@@ -1362,6 +1473,126 @@ class CodeParser:
                 bases.append(sub.text.decode("utf-8", errors="replace"))
         return bases
 
+    @staticmethod
+    def _gdscript_annotation_info(annotation_node) -> dict:
+        """Return ``{"name": str, "args": Optional[str]}`` for an annotation.
+
+        Handles ``@tool``, ``@export``, ``@export_range(0, 100)``, etc.
+        ``args`` is the raw source text of the ``arguments`` child (with
+        parentheses), or ``None`` when the annotation takes no arguments.
+        """
+        name = ""
+        args: Optional[str] = None
+        for c in annotation_node.children:
+            if c.type == "identifier" and not name:
+                name = c.text.decode("utf-8", errors="replace")
+            elif c.type == "arguments":
+                args = c.text.decode("utf-8", errors="replace")
+        return {"name": name, "args": args}
+
+    def _gdscript_build_annotation_line_map(
+        self, container,
+    ) -> dict[int, list[dict]]:
+        """Build a map from 0-indexed target-line -> list of annotations.
+
+        Walks ``container.children`` (a ``source`` or ``body`` node)
+        sequentially, buffering consecutive ``annotation`` siblings and
+        assigning them to the next "target" node (function_definition,
+        class_definition, class_name_statement, variable_statement,
+        signal_statement, enum_definition, or const_statement).
+
+        ``extends_statement`` is treated as transparent so file-level
+        ``@tool`` preceding ``extends Node`` / ``class_name Foo`` still
+        attaches to the class_name_statement. Any other node type clears
+        the pending buffer. Recurses into inner class bodies so per-
+        method annotations are also captured.
+        """
+        result: dict[int, list[dict]] = {}
+        targets = (
+            "function_definition",
+            "class_definition",
+            "class_name_statement",
+            "variable_statement",
+            "onready_variable_statement",
+            "signal_statement",
+            "enum_definition",
+            "const_statement",
+        )
+        transparent = ("extends_statement",)
+        pending: list[dict] = []
+        for child in container.children:
+            t = child.type
+            if t == "annotation":
+                pending.append(self._gdscript_annotation_info(child))
+                continue
+            if t in targets:
+                line = child.start_point[0]
+                if pending:
+                    result.setdefault(line, []).extend(pending)
+                    pending = []
+                # Some targets (notably function_definition inside a
+                # class_body, and every variable_statement) wrap their
+                # annotations as an inner ``annotations`` child instead
+                # of parsing them as preceding siblings. Pick those up
+                # too so both layouts work.
+                for cc in child.children:
+                    if cc.type == "annotations":
+                        for ann in cc.children:
+                            if ann.type == "annotation":
+                                result.setdefault(line, []).append(
+                                    self._gdscript_annotation_info(ann),
+                                )
+                        break
+                # GDScript 3.x: network-mode keywords (``master``,
+                # ``puppet``, ``remote``, ``remotesync``, ``mastersync``,
+                # ``puppetsync``) parse as a ``remote_keyword`` child of
+                # ``function_definition``. Surface the keyword text as a
+                # synthetic annotation so reviewers can filter on it the
+                # same way 4.x ``@rpc`` annotations behave.
+                if t == "function_definition":
+                    for cc in child.children:
+                        if cc.type == "remote_keyword":
+                            kw = cc.text.decode(
+                                "utf-8", errors="replace",
+                            ).strip()
+                            if kw:
+                                result.setdefault(line, []).append(
+                                    {"name": kw, "args": None},
+                                )
+                            break
+                if t == "class_definition":
+                    # Recurse into the inner class body.
+                    body = child.child_by_field_name("body")
+                    if body is None:
+                        for cc in child.children:
+                            if cc.type in ("body", "class_body"):
+                                body = cc
+                                break
+                    if body is not None:
+                        for k, v in (
+                            self._gdscript_build_annotation_line_map(body)
+                        ).items():
+                            result.setdefault(k, []).extend(v)
+                continue
+            if t in transparent:
+                continue
+            pending = []
+        return result
+
+    @staticmethod
+    def _gdscript_string_value(string_node) -> Optional[str]:
+        """Decode a tree-sitter-gdscript ``string`` node to its text value.
+
+        Prefers the inner ``string_content`` child when present; falls
+        back to stripping surrounding quotes from the raw node text.
+        """
+        for sc in string_node.children:
+            if sc.type == "string_content":
+                return sc.text.decode("utf-8", errors="replace")
+        return string_node.text.decode(
+            "utf-8", errors="replace",
+        ).strip("'\"")
+
     def _hoist_gdscript_module_class(
         self,
         root,
@@ -1602,8 +1833,482 @@ class CodeParser:
                     line=child.start_point[0] + 1,
                 ))
                 return True
+            # --- emit_signal("X", ...) -> extra CALLS edge to signal X ---
+            # The generic _extract_calls will still emit the CALLS edge to
+            # "emit_signal" itself, so we only add the signal-name edge here
+            # and fall through (return False).
+            if enclosing_func and child.children:
+                first = child.children[0]
+                if (
+                    first.type == "identifier"
+                    and first.text.decode(
+                        "utf-8", errors="replace",
+                    ) == "emit_signal"
+                ):
+                    for sub in child.children:
+                        if sub.type != "arguments":
+                            continue
+                        for arg in sub.children:
+                            if arg.type != "string":
+                                continue
+                            sig_name = self._gdscript_string_value(arg)
+                            if sig_name:
+                                edges.append(EdgeInfo(
+                                    kind="CALLS",
+                                    source=self._qualify(
+                                        enclosing_func,
+                                        file_path,
+                                        enclosing_class,
+                                    ),
+                                    target=sig_name,
+                                    file_path=file_path,
+                                    line=child.start_point[0] + 1,
+                                ))
+                            break
+                        break
+
+        # --- X.emit(...) -> extra CALLS edge to the signal receiver X ---
+        # GDScript idiom: `.emit()` is only valid on signals. Emit a CALLS
+        # edge targeting the receiver identifier so signal flows resolve
+        # the same way as emit_signal("X"). Fall through so the generic
+        # call extractor still records the bare "emit" edge from the
+        # inner attribute_call.
+        if node_type == "attribute" and enclosing_func:
+            receiver: Optional[str] = None
+            has_emit = False
+            for sub in child.children:
+                if sub.type == "identifier" and receiver is None:
+                    receiver = sub.text.decode(
+                        "utf-8", errors="replace",
+                    )
+                elif sub.type == "attribute_call":
+                    for cc in sub.children:
+                        if cc.type == "identifier":
+                            if cc.text.decode(
+                                "utf-8", errors="replace",
+                            ) == "emit":
+                                has_emit = True
+                            break
+            if has_emit and receiver:
+                edges.append(EdgeInfo(
+                    kind="CALLS",
+                    source=self._qualify(
+                        enclosing_func, file_path, enclosing_class,
+                    ),
+                    target=receiver,
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
+
+        # --- signal_statement: signal name(params) ---
+        if node_type == "signal_statement":
+            name_node = child.child_by_field_name("name")
+            if name_node is None:
+                for c in child.children:
+                    if c.type in ("name", "identifier"):
+                        name_node = c
+                        break
+            if name_node is None:
+                return True
+            signal_name = name_node.text.decode("utf-8", errors="replace")
+            params_text: Optional[str] = None
+            params_node = child.child_by_field_name("parameters")
+            if params_node is None:
+                for c in child.children:
+                    if c.type == "parameters":
+                        params_node = c
+                        break
+            if params_node is not None:
+                params_text = params_node.text.decode(
+                    "utf-8", errors="replace",
+                )
+            nodes.append(NodeInfo(
+                kind="Function",
+                name=signal_name,
+                file_path=file_path,
+                line_start=child.start_point[0] + 1,
+                line_end=child.end_point[0] + 1,
+                language="gdscript",
+                parent_name=enclosing_class,
+                params=params_text,
+                extra={"gdscript_kind": "signal"},
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=(
+                    self._qualify(enclosing_class, file_path, None)
+                    if enclosing_class else file_path
+                ),
+                target=self._qualify(
+                    signal_name, file_path, enclosing_class,
+                ),
+                file_path=file_path,
+                line=child.start_point[0] + 1,
+            ))
+            return True
+
+        # --- enum_definition: enum Name { A, B = 2 } or enum { A, B } ---
+        if node_type == "enum_definition":
+            name_node = child.child_by_field_name("name")
+            if name_node is None:
+                for c in child.children:
+                    if c.type == "name":
+                        name_node = c
+                        break
+            enum_name: Optional[str] = None
+            if name_node is not None:
+                enum_name = name_node.text.decode(
+                    "utf-8", errors="replace",
+                )
+
+            enumerators: list = []  # list[tuple[str, Optional[str], ts_node]]
+            for sub in child.children:
+                if sub.type != "enumerator_list":
+                    continue
+                for e in sub.children:
+                    if e.type != "enumerator":
+                        continue
+                    id_text: Optional[str] = None
+                    value_text: Optional[str] = None
+                    seen_equals = False
+                    for c in e.children:
+                        if c.type == "identifier" and id_text is None:
+                            id_text = c.text.decode(
+                                "utf-8", errors="replace",
+                            )
+                        elif c.type == "=":
+                            seen_equals = True
+                        elif seen_equals and c.type not in (",", "=", "}"):
+                            value_text = c.text.decode(
+                                "utf-8", errors="replace",
+                            )
+                    if id_text:
+                        enumerators.append((id_text, value_text, e))
+                break
+
+            if enum_name:
+                nodes.append(NodeInfo(
+                    kind="Function",
+                    name=enum_name,
+                    file_path=file_path,
+                    line_start=child.start_point[0] + 1,
+                    line_end=child.end_point[0] + 1,
+                    language="gdscript",
+                    parent_name=enclosing_class,
+                    extra={"gdscript_kind": "enum"},
+                ))
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=(
+                        self._qualify(enclosing_class, file_path, None)
+                        if enclosing_class else file_path
+                    ),
+                    target=self._qualify(
+                        enum_name, file_path, enclosing_class,
+                    ),
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
+                member_parent: Optional[str] = enum_name
+                # Enumerator CONTAINS source = the enum itself, qualified
+                # with a single level (matching the inner-class convention
+                # used by _extract_functions for class methods).
+                member_container = self._qualify(
+                    enum_name, file_path, None,
+                )
+            else:
+                member_parent = enclosing_class
+                member_container = (
+                    self._qualify(enclosing_class, file_path, None)
+                    if enclosing_class else file_path
+                )
+
+            for id_text, value_text, e_node in enumerators:
+                nodes.append(NodeInfo(
+                    kind="Function",
+                    name=id_text,
+                    file_path=file_path,
+                    line_start=e_node.start_point[0] + 1,
+                    line_end=e_node.end_point[0] + 1,
+                    language="gdscript",
+                    parent_name=member_parent,
+                    extra={
+                        "gdscript_kind": "enum_member",
+                        "value": value_text,
+                    },
+                ))
+                edges.append(EdgeInfo(
+                    kind="CONTAINS",
+                    source=member_container,
+                    target=self._qualify(
+                        id_text, file_path, member_parent,
+                    ),
+                    file_path=file_path,
+                    line=e_node.start_point[0] + 1,
+                ))
+            return True
+
+        # --- variable_statement: annotated vars, properties, lambdas ---
+        if node_type == "variable_statement":
+            if self._extract_gdscript_variable_statement(
+                child, source, file_path, nodes, edges,
+                enclosing_class, enclosing_func,
+                import_map, defined_names, _depth, language,
+                synthetic_annotations=None,
+            ):
+                return True
+
+        # --- 3.x onready_variable_statement: same shape as a variable
+        # carrying a single @onready annotation, but wrapped in a
+        # dedicated node type and with the annotation expressed as a
+        # bare ``onready`` keyword child rather than an ``annotations``
+        # wrapper. Synthesize the annotation and route through the same
+        # handler so properties/lambdas/type info all behave the same.
+        if node_type == "onready_variable_statement":
+            if self._extract_gdscript_variable_statement(
+                child, source, file_path, nodes, edges,
+                enclosing_class, enclosing_func,
+                import_map, defined_names, _depth, language,
+                synthetic_annotations=[{"name": "onready", "args": None}],
+            ):
+                return True
 
         return False
+
+    def _extract_gdscript_variable_statement(
+        self,
+        stmt,
+        source: bytes,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+        language: str,
+        synthetic_annotations: Optional[list[dict]] = None,
+    ) -> bool:
+        """Handle ``var x ...`` statements that carry extra structure.
+
+        Emits a Function node with ``extra["gdscript_kind"]`` set to
+        ``"property"`` or ``"lambda"`` when any of the following apply:
+
+        - An ``annotations`` child holds ``@export`` / ``@onready`` / etc.
+        - A ``setget`` child holds 4.x ``get_body``/``set_body`` or 3.x
+          ``setter``/``getter`` identifiers.
+        - The RHS expression is a ``lambda`` node.
+        - ``synthetic_annotations`` is non-empty (used by the 3.x
+          ``onready_variable_statement`` wrapper, which has no inline
+          ``annotations`` child but carries a bare ``onready`` keyword).
+
+        Plain uninteresting vars return False so the caller falls back to
+        generic recursion (which is a no-op for them).
+        """
+        name_node = stmt.child_by_field_name("name")
+        if name_node is None:
+            return False
+        var_name = name_node.text.decode("utf-8", errors="replace")
+
+        var_type: Optional[str] = None
+        type_node = stmt.child_by_field_name("type")
+        if type_node is not None:
+            var_type = type_node.text.decode("utf-8", errors="replace")
+
+        inline_annotations: list[dict] = list(synthetic_annotations or [])
+        setget_node = None
+        lambda_node = None
+        rhs_after_equals = False
+        for c in stmt.children:
+            if c.type == "annotations":
+                for a in c.children:
+                    if a.type == "annotation":
+                        inline_annotations.append(
+                            self._gdscript_annotation_info(a),
+                        )
+            elif c.type == "setget":
+                setget_node = c
+            elif c.type == "=":
+                rhs_after_equals = True
+            elif rhs_after_equals and c.type == "lambda":
+                lambda_node = c
+
+        if not (inline_annotations or setget_node or lambda_node):
+            return False
+
+        extra: dict = {}
+        if lambda_node is not None:
+            extra["gdscript_kind"] = "lambda"
+        else:
+            extra["gdscript_kind"] = "property"
+        if var_type:
+            extra["var_type"] = var_type
+        if inline_annotations:
+            extra["annotations"] = inline_annotations
+
+        var_qualified = self._qualify(
+            var_name, file_path, enclosing_class,
+        )
+        nodes.append(NodeInfo(
+            kind="Function",
+            name=var_name,
+            file_path=file_path,
+            line_start=stmt.start_point[0] + 1,
+            line_end=stmt.end_point[0] + 1,
+            language="gdscript",
+            parent_name=enclosing_class,
+            return_type=var_type,
+            extra=extra,
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=(
+                self._qualify(enclosing_class, file_path, None)
+                if enclosing_class else file_path
+            ),
+            target=var_qualified,
+            file_path=file_path,
+            line=stmt.start_point[0] + 1,
+        ))
+
+        # --- 4.x property accessors (get_body / set_body) ---
+        if setget_node is not None:
+            self._extract_gdscript_property_accessors(
+                setget_node, source, file_path, nodes, edges,
+                enclosing_class, var_name,
+                import_map, defined_names, _depth, language,
+            )
+
+        # --- Lambda body: recurse so CALLS inside the lambda are captured ---
+        if lambda_node is not None:
+            self._extract_from_tree(
+                lambda_node, source, language, file_path, nodes, edges,
+                enclosing_class=enclosing_class,
+                enclosing_func=var_name,
+                import_map=import_map, defined_names=defined_names,
+                _depth=_depth + 1,
+            )
+
+        return True
+
+    def _extract_gdscript_property_accessors(
+        self,
+        setget_node,
+        source: bytes,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        var_name: str,
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+        language: str,
+    ) -> None:
+        """Emit accessor nodes for a ``setget`` block.
+
+        Handles both dialects:
+        - 4.x: ``setget > get_body`` / ``set_body`` — emit Function nodes
+          named ``get`` / ``set`` parented to the property, then recurse
+          into the bodies so CALLS inside accessors are captured.
+        - 3.x legacy: ``setget > setget + setter + getter`` (plain
+          identifiers naming existing module-level funcs) — record the
+          linked names in the property node's ``extra`` via the grand-
+          parent var_name; since the getter/setter funcs already flow
+          through generic function extraction, no new nodes are emitted.
+        """
+        legacy_setter: Optional[str] = None
+        legacy_getter: Optional[str] = None
+        for child in setget_node.children:
+            if child.type == "get_body":
+                self._emit_gdscript_accessor(
+                    child, "get", source, file_path, nodes, edges,
+                    enclosing_class, var_name,
+                    import_map, defined_names, _depth, language,
+                )
+            elif child.type == "set_body":
+                self._emit_gdscript_accessor(
+                    child, "set", source, file_path, nodes, edges,
+                    enclosing_class, var_name,
+                    import_map, defined_names, _depth, language,
+                )
+            elif child.type == "setter":
+                legacy_setter = child.text.decode(
+                    "utf-8", errors="replace",
+                )
+            elif child.type == "getter":
+                legacy_getter = child.text.decode(
+                    "utf-8", errors="replace",
+                )
+        if legacy_setter or legacy_getter:
+            # Patch legacy identifiers onto the property node we just
+            # emitted (last in nodes list matching var_name).
+            for n in reversed(nodes):
+                if (
+                    n.name == var_name
+                    and n.language == "gdscript"
+                    and n.extra.get("gdscript_kind") == "property"
+                ):
+                    if legacy_setter:
+                        n.extra["legacy_setter"] = legacy_setter
+                    if legacy_getter:
+                        n.extra["legacy_getter"] = legacy_getter
+                    break
+
+    def _emit_gdscript_accessor(
+        self,
+        body_node,
+        accessor_name: str,
+        source: bytes,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        var_name: str,
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+        language: str,
+    ) -> None:
+        """Emit a single ``get``/``set`` accessor as a Function node.
+
+        The accessor's parent is the property (``var_name``). Its CONTAINS
+        edge source uses single-level qualification to match the inner-
+        class convention that _extract_functions applies to methods.
+        """
+        accessor_parent_qn = self._qualify(
+            var_name, file_path, None,
+        )
+        accessor_qn = self._qualify(
+            accessor_name, file_path, var_name,
+        )
+        nodes.append(NodeInfo(
+            kind="Function",
+            name=accessor_name,
+            file_path=file_path,
+            line_start=body_node.start_point[0] + 1,
+            line_end=body_node.end_point[0] + 1,
+            language="gdscript",
+            parent_name=var_name,
+            extra={"gdscript_kind": "accessor"},
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=accessor_parent_qn,
+            target=accessor_qn,
+            file_path=file_path,
+            line=body_node.start_point[0] + 1,
+        ))
+        # Recurse into the accessor body so inner calls get CALLS edges
+        # with this accessor as the caller.
+        self._extract_from_tree(
+            body_node, source, language, file_path, nodes, edges,
+            enclosing_class=enclosing_class,
+            enclosing_func=accessor_name,
+            import_map=import_map, defined_names=defined_names,
+            _depth=_depth + 1,
+        )
 
     # ------------------------------------------------------------------
     # JS/TS: variable-assigned functions  (const foo = () => {})
@@ -2394,6 +3099,26 @@ class CodeParser:
                 target = base.with_suffix(".dart")
                 if target.is_file():
                     return str(target.resolve())
+
+        elif language == "gdscript":
+            # preload("res://a/b.gd") / load("res://a/b.gd"): the GDScript
+            # extractor already stripped the res:// prefix. Use the project
+            # resolver to map the project-relative path to the actual
+            # filesystem path when a project.godot is present.
+            resolved = self._godot_project_resolver.resolve_res_path(
+                module, file_path,
+            )
+            if resolved:
+                return resolved
+            # Fallback: probe next to the caller for local relative files.
+            gd_base: Path = caller_dir / module
+            if gd_base.is_file():
+                return str(gd_base.resolve())
+            if not gd_base.suffix:
+                for ext in (".gd", ".tscn", ".tres"):
+                    gd_candidate = gd_base.with_suffix(ext)
+                    if gd_candidate.is_file():
+                        return str(gd_candidate.resolve())
 
         return None
 
