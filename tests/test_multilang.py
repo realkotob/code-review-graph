@@ -807,3 +807,88 @@ class TestLuaParsing:
         sources = {e.source.split("::")[-1] for e in calls}
         assert "Dog.fetch" in sources  # Dog:fetch calls self:speak and print
         assert "Animal.speak" in sources  # Animal:speak calls log:info
+
+
+class TestGDScriptParsing:
+    def setup_method(self):
+        self.parser = CodeParser()
+        self.nodes, self.edges = self.parser.parse_file(FIXTURES / "sample.gd")
+
+    def test_detects_language(self):
+        assert self.parser.detect_language(Path("foo.gd")) == "gdscript"
+        assert self.parser.detect_language(Path("player.gd")) == "gdscript"
+
+    def test_finds_public_class(self):
+        classes = [n for n in self.nodes if n.kind == "Class"]
+        names = {c.name for c in classes}
+        assert "MyClass" in names
+
+    def test_finds_inner_class(self):
+        classes = [n for n in self.nodes if n.kind == "Class"]
+        names = {c.name for c in classes}
+        assert "Inner" in names
+
+    def test_finds_top_level_functions(self):
+        funcs = [n for n in self.nodes if n.kind == "Function"]
+        names = {f.name for f in funcs}
+        assert "_ready" in names
+        assert "util" in names
+        assert "helper" in names
+
+    def test_inner_class_method_parent(self):
+        helper = [
+            n for n in self.nodes
+            if n.name == "helper" and n.kind == "Function"
+        ]
+        assert len(helper) == 1
+        assert helper[0].parent_name == "Inner"
+
+    def test_module_functions_attached_to_class_name(self):
+        # _ready and util live at module level but conceptually belong to
+        # the class_name MyClass. The hoist pass sets parent_name.
+        ready = [n for n in self.nodes if n.name == "_ready"]
+        util = [n for n in self.nodes if n.name == "util"]
+        assert len(ready) == 1
+        assert len(util) == 1
+        assert ready[0].parent_name == "MyClass"
+        assert util[0].parent_name == "MyClass"
+
+    def test_inherits_edges(self):
+        inherits = [e for e in self.edges if e.kind == "INHERITS"]
+        # Source is a qualified name like "<file>::MyClass" or
+        # "<file>::MyClass.Inner" for the nested class.
+        pairs = {
+            (e.source.split("::")[-1].split(".")[-1], e.target)
+            for e in inherits
+        }
+        assert ("MyClass", "Node") in pairs
+        assert ("Inner", "Resource") in pairs
+
+    def test_preload_and_load_become_imports(self):
+        imports = [e for e in self.edges if e.kind == "IMPORTS_FROM"]
+        targets = {e.target for e in imports}
+        # res:// prefix is stripped; bare path is recorded.
+        assert "foo.gd" in targets
+        assert "bar.gd" in targets
+
+    def test_preload_not_recorded_as_call(self):
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        targets = {e.target for e in calls}
+        assert "preload" not in targets
+        assert "load" not in targets
+
+    def test_ready_calls_helper_and_emit_signal(self):
+        calls = [e for e in self.edges if e.kind == "CALLS"]
+        ready_calls = {
+            e.target for e in calls
+            if e.source.split("::")[-1].endswith("_ready")
+        }
+        assert any(t.endswith("helper") or t == "helper" for t in ready_calls)
+        assert any(
+            t == "emit_signal" or t.endswith("emit_signal")
+            for t in ready_calls
+        )
+
+    def test_nodes_have_gdscript_language(self):
+        for node in self.nodes:
+            assert node.language == "gdscript"

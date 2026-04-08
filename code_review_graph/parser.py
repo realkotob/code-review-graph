@@ -101,6 +101,7 @@ EXTENSION_TO_LANGUAGE: dict[str, str] = {
     ".t": "perl",
     ".xs": "c",  # Perl XS: parsed as C to capture functions/structs/includes
     ".lua": "lua",
+    ".gd": "gdscript",
     ".ipynb": "notebook",
 }
 
@@ -136,6 +137,10 @@ _CLASS_TYPES: dict[str, list[str]] = {
     ],
     "dart": ["class_definition", "mixin_declaration", "enum_declaration"],
     "lua": [],  # Lua has no class keyword; table-based OOP handled via constructs handler
+    # GDScript: class_name_statement is the script's public class (module-level);
+    # class_definition covers inner classes.  Both flow through _extract_classes
+    # after _extract_gdscript_constructs emits INHERITS edges.
+    "gdscript": ["class_definition", "class_name_statement"],
 }
 
 _FUNCTION_TYPES: dict[str, list[str]] = {
@@ -170,6 +175,7 @@ _FUNCTION_TYPES: dict[str, list[str]] = {
     # function_signature inside it).
     "dart": ["function_signature"],
     "lua": ["function_declaration"],
+    "gdscript": ["function_definition"],
 }
 
 _IMPORT_TYPES: dict[str, list[str]] = {
@@ -195,6 +201,8 @@ _IMPORT_TYPES: dict[str, list[str]] = {
     "dart": ["import_or_export"],
     # Lua: require() is a function_call, handled via _extract_lua_constructs
     "lua": [],
+    # GDScript: preload()/load() are handled via _extract_gdscript_constructs
+    "gdscript": [],
 }
 
 _CALL_TYPES: dict[str, list[str]] = {
@@ -220,6 +228,9 @@ _CALL_TYPES: dict[str, list[str]] = {
     "scala": ["call_expression", "instance_expression", "generic_function"],
     "solidity": ["call_expression"],
     "lua": ["function_call"],
+    # GDScript: `call` is a plain f() or chain-terminating call;
+    # `attribute_call` is the trailing method in obj.foo.bar()
+    "gdscript": ["call", "attribute_call"],
 }
 
 # Patterns that indicate a test function
@@ -242,6 +253,8 @@ _TEST_FILE_PATTERNS = [
     re.compile(r".*_test\.dart$"),
     re.compile(r"test[_-].*\.[rR]$"),
     re.compile(r"tests/testthat/"),
+    re.compile(r"test_.*\.gd$"),
+    re.compile(r".*_test\.gd$"),
 ]
 
 _TEST_RUNNER_NAMES = frozenset({
@@ -886,8 +899,24 @@ class CodeParser:
         import_types = set(_IMPORT_TYPES.get(language, []))
         call_types = set(_CALL_TYPES.get(language, []))
 
+        # GDScript: hoist class_name_statement at the file root so that sibling
+        # module-level function_definitions get parent_name set correctly. The
+        # hoisted node is tracked so the main loop skips it (the Class node
+        # and INHERITS edges are emitted inside the hoister).
+        gdscript_hoisted_ids: set[int] = set()
+        if language == "gdscript" and _depth == 0 and enclosing_class is None:
+            hoisted_name = self._hoist_gdscript_module_class(
+                root, source, file_path, nodes, edges, gdscript_hoisted_ids,
+            )
+            if hoisted_name is not None:
+                enclosing_class = hoisted_name
+
         for child in root.children:
             node_type = child.type
+
+            # Skip children already handled by the gdscript pre-scan.
+            if gdscript_hoisted_ids and id(child) in gdscript_hoisted_ids:
+                continue
 
             # --- R-specific constructs ---
             if language == "r" and self._extract_r_constructs(
@@ -899,6 +928,14 @@ class CodeParser:
 
             # --- Lua-specific constructs ---
             if language == "lua" and self._extract_lua_constructs(
+                child, node_type, source, language, file_path,
+                nodes, edges, enclosing_class, enclosing_func,
+                import_map, defined_names, _depth,
+            ):
+                continue
+
+            # --- GDScript-specific constructs ---
+            if language == "gdscript" and self._extract_gdscript_constructs(
                 child, node_type, source, language, file_path,
                 nodes, edges, enclosing_class, enclosing_func,
                 import_map, defined_names, _depth,
@@ -1296,6 +1333,277 @@ class CodeParser:
                         raw = arg.text.decode("utf-8", errors="replace")
                         return raw.strip("'\"")
         return None
+
+    # ------------------------------------------------------------------
+    # GDScript-specific helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _gdscript_extract_extends_bases(extends_node) -> list[str]:
+        """Walk an extends_statement node and return the list of base names.
+
+        Handles both `extends Node` (type > identifier) and
+        `extends "res://base.gd"` (string child).
+        """
+        bases: list[str] = []
+        for sub in extends_node.children:
+            if sub.type == "type":
+                for ident in sub.children:
+                    if ident.type == "identifier":
+                        bases.append(
+                            ident.text.decode("utf-8", errors="replace"),
+                        )
+                        break
+            elif sub.type == "string":
+                raw = sub.text.decode("utf-8", errors="replace")
+                bases.append(raw.strip("'\""))
+            elif sub.type == "identifier":
+                # Rare fallback: some grammars expose identifier directly
+                bases.append(sub.text.decode("utf-8", errors="replace"))
+        return bases
+
+    def _hoist_gdscript_module_class(
+        self,
+        root,
+        source: bytes,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        handled_ids: set[int],
+    ) -> Optional[str]:
+        """Pre-scan a gdscript file root for class_name_statement.
+
+        Emits a Class node + INHERITS edges and returns the class name so
+        the caller can set enclosing_class for the entire file-level walk.
+        When the class_name_statement is processed this way, its id is
+        added to ``handled_ids`` so the main loop skips it (preventing
+        the generic _extract_classes from creating a duplicate node).
+
+        Also handles the sibling `extends_statement` form and records its
+        id as handled so it doesn't flow through the main loop.
+        """
+        class_node = None
+        for child in root.children:
+            if child.type == "class_name_statement":
+                class_node = child
+                break
+
+        if class_node is None:
+            return None
+
+        # Extract name: class_name_statement's 'name' field.
+        name_node = class_node.child_by_field_name("name")
+        if name_node is None:
+            # Fallback: first identifier / name child
+            for c in class_node.children:
+                if c.type in ("name", "identifier"):
+                    name_node = c
+                    break
+        if name_node is None:
+            return None
+        class_name = name_node.text.decode("utf-8", errors="replace")
+
+        nodes.append(NodeInfo(
+            kind="Class",
+            name=class_name,
+            file_path=file_path,
+            line_start=class_node.start_point[0] + 1,
+            line_end=class_node.end_point[0] + 1,
+            language="gdscript",
+            parent_name=None,
+        ))
+        edges.append(EdgeInfo(
+            kind="CONTAINS",
+            source=file_path,
+            target=self._qualify(class_name, file_path, None),
+            file_path=file_path,
+            line=class_node.start_point[0] + 1,
+        ))
+        handled_ids.add(id(class_node))
+
+        # Extends: may be an inline field on class_name_statement,
+        # OR a sibling extends_statement under the same source node.
+        extends_node = class_node.child_by_field_name("extends")
+        if extends_node is None:
+            for sib in root.children:
+                if sib.type == "extends_statement":
+                    extends_node = sib
+                    handled_ids.add(id(sib))
+                    break
+
+        if extends_node is not None:
+            for base in self._gdscript_extract_extends_bases(extends_node):
+                edges.append(EdgeInfo(
+                    kind="INHERITS",
+                    source=self._qualify(class_name, file_path, None),
+                    target=base,
+                    file_path=file_path,
+                    line=extends_node.start_point[0] + 1,
+                ))
+
+        return class_name
+
+    def _gdscript_get_preload_target(self, call_node) -> Optional[str]:
+        """If call_node is preload("...") or load("..."), return the stripped
+        path (with any res:// prefix removed). Otherwise None.
+
+        Accepts both `call` nodes (identifier + arguments) and raw identifier-
+        -rooted shapes — the first child must be an identifier whose text is
+        ``preload`` or ``load``, followed by an ``arguments`` child holding a
+        string literal as its first argument.
+        """
+        if not call_node.children:
+            return None
+        first = call_node.children[0]
+        if first.type != "identifier":
+            return None
+        call_name = first.text.decode("utf-8", errors="replace")
+        if call_name not in ("preload", "load"):
+            return None
+
+        for sub in call_node.children:
+            if sub.type != "arguments":
+                continue
+            for arg in sub.children:
+                if arg.type != "string":
+                    continue
+                # String node may contain string_content child
+                for sc in arg.children:
+                    if sc.type == "string_content":
+                        raw = sc.text.decode("utf-8", errors="replace")
+                        return raw[6:] if raw.startswith("res://") else raw
+                # Fallback: strip quotes from raw text
+                raw = arg.text.decode("utf-8", errors="replace").strip("'\"")
+                return raw[6:] if raw.startswith("res://") else raw
+            return None
+        return None
+
+    def _extract_gdscript_constructs(
+        self,
+        child,
+        node_type: str,
+        source: bytes,
+        language: str,
+        file_path: str,
+        nodes: list[NodeInfo],
+        edges: list[EdgeInfo],
+        enclosing_class: Optional[str],
+        enclosing_func: Optional[str],
+        import_map: Optional[dict[str, str]],
+        defined_names: Optional[set[str]],
+        _depth: int,
+    ) -> bool:
+        """Handle GDScript-specific AST constructs.
+
+        Returns True if the child was fully handled and should be skipped
+        by the main loop.
+
+        Handles:
+        - ``class_name_statement`` that was not pre-hoisted (e.g. encountered
+          during a recursive walk) — emits Class + INHERITS and claims it.
+        - Bare top-level ``extends_statement`` (no class_name in the file) —
+          emits a file-level INHERITS edge.
+        - ``const X = preload("res://x.gd")`` / ``load("...")`` — emits an
+          IMPORTS_FROM edge instead of letting it become a CALLS edge.
+        - Top-level ``preload("...")`` / ``load("...")`` call not wrapped
+          in a const — same IMPORTS_FROM emission.
+        """
+        # --- class_name_statement encountered outside the pre-hoist ---
+        if node_type == "class_name_statement":
+            name_node = child.child_by_field_name("name")
+            if name_node is None:
+                for c in child.children:
+                    if c.type in ("name", "identifier"):
+                        name_node = c
+                        break
+            if name_node is None:
+                return True  # malformed — skip generic path
+            class_name = name_node.text.decode("utf-8", errors="replace")
+            nodes.append(NodeInfo(
+                kind="Class",
+                name=class_name,
+                file_path=file_path,
+                line_start=child.start_point[0] + 1,
+                line_end=child.end_point[0] + 1,
+                language="gdscript",
+                parent_name=enclosing_class,
+            ))
+            edges.append(EdgeInfo(
+                kind="CONTAINS",
+                source=(
+                    self._qualify(enclosing_class, file_path, None)
+                    if enclosing_class else file_path
+                ),
+                target=self._qualify(class_name, file_path, enclosing_class),
+                file_path=file_path,
+                line=child.start_point[0] + 1,
+            ))
+            extends_node = child.child_by_field_name("extends")
+            if extends_node is not None:
+                for base in self._gdscript_extract_extends_bases(extends_node):
+                    edges.append(EdgeInfo(
+                        kind="INHERITS",
+                        source=self._qualify(
+                            class_name, file_path, enclosing_class,
+                        ),
+                        target=base,
+                        file_path=file_path,
+                        line=extends_node.start_point[0] + 1,
+                    ))
+            return True
+
+        # --- Bare module-level extends_statement with no class_name ---
+        # (If a class_name was hoisted, the extends was already consumed and
+        # this branch won't fire because the pre-scan added its id to
+        # handled_ids.)
+        if node_type == "extends_statement" and enclosing_class is None:
+            for base in self._gdscript_extract_extends_bases(child):
+                edges.append(EdgeInfo(
+                    kind="INHERITS",
+                    source=file_path,
+                    target=base,
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
+            return True
+
+        # --- const X = preload("res://x.gd") / load(...) ---
+        if node_type == "const_statement":
+            for sub in child.children:
+                if sub.type != "call":
+                    continue
+                target = self._gdscript_get_preload_target(sub)
+                if target is not None:
+                    resolved = self._resolve_module_to_file(
+                        target, file_path, language,
+                    )
+                    edges.append(EdgeInfo(
+                        kind="IMPORTS_FROM",
+                        source=file_path,
+                        target=resolved if resolved else target,
+                        file_path=file_path,
+                        line=child.start_point[0] + 1,
+                    ))
+                    return True
+            return False  # plain const — let generic recursion handle it
+
+        # --- Bare preload/load call not in a const ---
+        if node_type == "call":
+            target = self._gdscript_get_preload_target(child)
+            if target is not None:
+                resolved = self._resolve_module_to_file(
+                    target, file_path, language,
+                )
+                edges.append(EdgeInfo(
+                    kind="IMPORTS_FROM",
+                    source=file_path,
+                    target=resolved if resolved else target,
+                    file_path=file_path,
+                    line=child.start_point[0] + 1,
+                ))
+                return True
+
+        return False
 
     # ------------------------------------------------------------------
     # JS/TS: variable-assigned functions  (const foo = () => {})
@@ -2287,6 +2595,20 @@ class CodeParser:
                     for sub in child.children:
                         if sub.type == "type_identifier":
                             bases.append(sub.text.decode("utf-8", errors="replace"))
+        elif language == "gdscript":
+            # Inner class: `class Inner extends Resource:` — extends is a
+            # named field on class_definition.
+            extends_node = node.child_by_field_name("extends")
+            if extends_node is None:
+                # Fallback: walk children looking for extends_statement.
+                for child in node.children:
+                    if child.type == "extends_statement":
+                        extends_node = child
+                        break
+            if extends_node is not None:
+                bases.extend(
+                    self._gdscript_extract_extends_bases(extends_node),
+                )
         return bases
 
     def _extract_import(self, node, language: str, source: bytes) -> list[str]:
