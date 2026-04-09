@@ -236,6 +236,11 @@ class GraphStore:
         self, file_path: str, nodes: list[NodeInfo], edges: list[EdgeInfo], fhash: str = ""
     ) -> None:
         """Atomically replace all data for a file."""
+        # Flush any pending implicit transaction opened by earlier DML on this
+        # connection so the explicit BEGIN IMMEDIATE below doesn't trip SQLite's
+        # "cannot start a transaction within a transaction" error.
+        if self._conn.in_transaction:
+            self._conn.commit()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             self.remove_file_data(file_path)

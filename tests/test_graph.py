@@ -107,6 +107,25 @@ class TestGraphStore:
         result = self.store.get_nodes_by_file("/test/file.py")
         assert len(result) == 2
 
+    def test_store_file_nodes_edges_after_dangling_dml(self):
+        """Regression: store_file_nodes_edges must recover when the connection
+        is already inside an implicit transaction opened by a prior DML (e.g.
+        the stale-file purge loop in full_build). Previously this raised
+        'cannot start a transaction within a transaction'.
+        """
+        # Simulate the purge loop: run DELETEs without committing so the
+        # connection is left in an implicit transaction.
+        self.store.upsert_node(self._make_file_node("/stale.py"))
+        self.store.commit()
+        self.store.remove_file_data("/stale.py")
+        assert self.store._conn.in_transaction
+
+        nodes = [self._make_file_node(), self._make_func_node()]
+        # Should not raise sqlite3.OperationalError.
+        self.store.store_file_nodes_edges("/test/file.py", nodes, [])
+
+        assert len(self.store.get_nodes_by_file("/test/file.py")) == 2
+
     def test_search_nodes(self):
         self.store.upsert_node(self._make_func_node("authenticate"))
         self.store.upsert_node(self._make_func_node("authorize"))

@@ -352,8 +352,13 @@ def full_build(repo_root: Path, store: GraphStore) -> dict:
     # Purge stale data from files no longer on disk
     existing_files = set(store.get_all_files())
     current_abs = {str(repo_root / f) for f in files}
-    for stale in existing_files - current_abs:
-        store.remove_file_data(stale)
+    stale_files = existing_files - current_abs
+    if stale_files:
+        for stale in stale_files:
+            store.remove_file_data(stale)
+        # Commit the implicit transaction opened by the DELETEs so the
+        # subsequent BEGIN IMMEDIATE in store_file_nodes_edges succeeds.
+        store.commit()
 
     total_nodes = 0
     total_edges = 0
