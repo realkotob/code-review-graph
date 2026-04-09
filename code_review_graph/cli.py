@@ -129,6 +129,7 @@ def _handle_init(args: argparse.Namespace) -> None:
     # Legacy: --skills/--hooks/--all still accepted (no-op, everything is default)
 
     from .skills import (
+        PLATFORMS,
         generate_skills,
         inject_claude_md,
         inject_platform_instructions,
@@ -148,8 +149,8 @@ def _handle_init(args: argparse.Namespace) -> None:
         install_hooks(repo_root)
         print(f"Installed hooks in {repo_root / '.claude' / 'settings.json'}")
 
-        # Cursor hooks (user-level, installed when target includes cursor)
-        if target in ("all", "cursor"):
+        # Cursor hooks (user-level, only if ~/.cursor exists — matching MCP detect)
+        if target in ("all", "cursor") and PLATFORMS["cursor"]["detect"]():
             try:
                 hooks_path = install_cursor_hooks()
                 print(f"Installed Cursor hooks in {hooks_path}")
