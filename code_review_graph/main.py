@@ -362,6 +362,7 @@ def list_graph_stats_tool(
 @mcp.tool()
 def get_docs_section_tool(
     section_name: str,
+    repo_root: Optional[str] = None,
 ) -> dict:
     """Get a specific section from the LLM-optimized documentation reference.
 
@@ -373,8 +374,9 @@ def get_docs_section_tool(
 
     Args:
         section_name: The section to retrieve (e.g. "review-delta", "usage").
+        repo_root: Repository root path. Auto-detected if omitted.
     """
-    return get_docs_section(section_name=section_name, repo_root=_default_repo_root)
+    return get_docs_section(section_name=section_name, repo_root=repo_root)
 
 
 @mcp.tool()
