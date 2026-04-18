@@ -368,6 +368,22 @@ export CRG_OPENAI_BATCH_SIZE=100                        # lower for gateways wit
 The cloud-egress warning is auto-skipped when the base URL points to localhost
 (`127.0.0.1`, `localhost`, `0.0.0.0`, `::1`).
 
+> **Model selection tip.** Avoid `-preview` / `-beta` / `-exp` model IDs
+> (e.g. `google/gemini-embedding-2-preview`) for anything you plan to keep
+> long-term — preview models can change weights (different dimension → full
+> re-embed required) or be deprecated without notice. Prefer stable GA
+> releases such as `text-embedding-3-small` / `text-embedding-3-large` (OpenAI),
+> `Qwen/Qwen3-Embedding-8B` (via self-hosted vLLM / LocalAI), or
+> `gemini-embedding-001` (via the native Gemini provider, which requires
+> `GOOGLE_API_KEY` instead of the OpenAI-compatible path).
+>
+> Also note: `code-review-graph` currently embeds **function signatures only**
+> (~10 tokens per node, e.g. `"parse_file function (path: str) returns Tree"`).
+> Models whose headline quality comes from long-context body understanding
+> (such as Gemini 2 or Qwen3-8B at their MTEB-code SOTA scores) will see a
+> much narrower quality gap against smaller models at this input length.
+> Body/docstring embedding is tracked as a follow-up enhancement.
+
 </details>
 
 ---

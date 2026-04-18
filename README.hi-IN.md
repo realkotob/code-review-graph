@@ -284,6 +284,10 @@ export CRG_OPENAI_BATCH_SIZE=100                        # टाइट बैच
 
 जब base URL localhost (`127.0.0.1`, `localhost`, `0.0.0.0`, `::1`) की ओर इशारा करता है, तो क्लाउड-egress चेतावनी अपने आप स्किप हो जाती है।
 
+> **मॉडल चुनने की सलाह।** लंबे समय के उपयोग के लिए `-preview` / `-beta` / `-exp` वाले model ID (जैसे `google/gemini-embedding-2-preview`) से बचें — preview मॉडल्स के वज़न बदल सकते हैं (डाइमेंशन बदलने पर पूरा re-embed करना पड़ेगा) या बिना नोटिस deprecate हो सकते हैं। स्टेबल GA मॉडल्स की सलाह दी जाती है: `text-embedding-3-small` / `text-embedding-3-large` (OpenAI), `Qwen/Qwen3-Embedding-8B` (vLLM / LocalAI सेल्फ-होस्टेड के ज़रिए), या `gemini-embedding-001` (नेटिव Gemini provider के ज़रिए, `GOOGLE_API_KEY` चाहिए).
+>
+> साथ ही ध्यान दें: वर्तमान में `code-review-graph` केवल **फ़ंक्शन सिग्नेचर** एम्बेड करता है (प्रति नोड ~10 tokens, जैसे `"parse_file function (path: str) returns Tree"`). जिन मॉडल्स की क्वालिटी का मुख्य source लंबे context में function body को समझना है (जैसे Gemini 2 या Qwen3-8B के MTEB-code SOTA स्कोर्स), वे इस इनपुट लंबाई पर छोटे मॉडल्स से कम अंतर दिखाएंगे। Body / docstring एम्बेडिंग को फ़ॉलो-अप एन्हांसमेंट के रूप में ट्रैक किया जा रहा है।
+
 </details>
 
 ---
